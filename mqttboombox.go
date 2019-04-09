@@ -3,12 +3,9 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
-	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
@@ -18,15 +15,14 @@ const (
 	recordDataSep string = "|"
 )
 
-// commandline flag parsing
-func flagParse() (brokerURL string, topics []string, isBinary bool, isCounter bool, isFastforward bool) {
-	flag.StringVar(&brokerURL, "broker", "tcp://localhost:1883", "MQTT broker URL")
-	flag.BoolVar(&isBinary, "binary", false, "binary data mode")
-	flag.BoolVar(&isCounter, "counter", false, "print messages counter")
-	flag.BoolVar(&isFastforward, "ff", false, "fastforward, skip messages timing")
-	flag.Parse()
-	topics = flag.Args()
-	return
+type boombox struct {
+	brokerURL     string
+	topics        []string
+	isBinary      bool
+	isCounter     bool
+	isFastforward bool
+	mqttclient    MQTT.Client
+	recordchan    chan message
 }
 
 // MQTT message wrapper
@@ -35,65 +31,60 @@ type message struct {
 	msg  MQTT.Message
 }
 
-// record buffered channel
-var recordchan = make(chan message, 100)
-
-// default mqtt message handler
-var onMessage MQTT.MessageHandler = func(client MQTT.Client, msg MQTT.Message) {
-	recordchan <- message{time.Now(), msg}
-}
-
 // connects to the mqtt broker
-func mqttConnect(brokerURL string) MQTT.Client {
-	opts := MQTT.NewClientOptions().AddBroker(brokerURL)
-	//~ opts.SetClientID("mqttboombox" + strconv.FormatInt(time.Now().Unix(), 16))
-	opts.SetDefaultPublishHandler(onMessage)
-	client := MQTT.NewClient(opts)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
+func (boombox *boombox) mqttConnect() {
+	// options
+	opts := MQTT.NewClientOptions().AddBroker(boombox.brokerURL)
+	// opts.SetClientID("mqttboombox" + strconv.FormatInt(time.Now().Unix(), 16))
+	opts.SetDefaultPublishHandler(func(client MQTT.Client, msg MQTT.Message) {
+		boombox.recordchan <- message{time.Now(), msg}
+	})
+	boombox.mqttclient = MQTT.NewClient(opts)
+	if token := boombox.mqttclient.Connect(); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
-	return client
 }
 
-// subscribe to a list of topics
-func mqttSubscribe(client MQTT.Client, topics []string) {
+// subscribe to the list of topics
+func (boombox *boombox) mqttSubscribe() {
 	// TODO replace with SubscribeMultiple
-	for _, t := range topics {
-		if token := client.Subscribe(t, 0, nil); token.Wait() && token.Error() != nil {
+	for _, topic := range boombox.topics {
+		if token := boombox.mqttclient.Subscribe(topic, 0, nil); token.Wait() && token.Error() != nil {
 			panic(token.Error())
 		}
 	}
 }
 
 // RECORD!
-func record(client MQTT.Client, topics []string, isBinary bool, isCounter bool) {
-	// checks topics list
-	if len(topics) == 0 {
-		//    exit?
-		// fmt.Fprintln(os.Stderr, "You must specify at least one topic!")
-		// os.Exit(1)
-		//    or default all topics?
-		topics = []string{"#"}
-	}
-
-	lasttime := time.Now()
-
-	mqttSubscribe(client, topics)
-
-	fmt.Fprintln(os.Stderr, "INPUT TOPICS", topics)
+func (boombox *boombox) record() {
+	fmt.Fprintln(os.Stderr, "RECORDING from", boombox.brokerURL)
 	var (
-		count   int
-		m       message
-		elapsed time.Duration
-		payload string
+		count    int
+		m        message
+		payload  string
+		elapsed  time.Duration
+		lasttime = time.Now()
 	)
+
+	// record buffered channel
+	boombox.recordchan = make(chan message, 100)
+
+	// checks topics list and subscribe
+	if len(boombox.topics) == 0 {
+		// default to all topics
+		boombox.topics = []string{"#"}
+	}
+	boombox.mqttSubscribe()
+
+	fmt.Fprintln(os.Stderr, "INPUT TOPICS", boombox.topics)
+
 	for {
-		m = <-recordchan
+		m = <-boombox.recordchan
 
 		elapsed = m.time.Sub(lasttime)
 		lasttime = m.time
 
-		if isBinary {
+		if boombox.isBinary {
 			payload = base64.StdEncoding.EncodeToString(m.msg.Payload())
 		} else {
 			payload = string(m.msg.Payload())
@@ -105,7 +96,7 @@ func record(client MQTT.Client, topics []string, isBinary bool, isCounter bool) 
 			recordDataSep,
 			payload)
 
-		if isCounter {
+		if boombox.isCounter {
 			count++
 			fmt.Fprintf(os.Stderr, "\rREC  #%d", count)
 		}
@@ -113,7 +104,8 @@ func record(client MQTT.Client, topics []string, isBinary bool, isCounter bool) 
 }
 
 // PLAY!
-func play(client MQTT.Client, isBinary bool, isCounter bool, isFastforward bool) {
+func (boombox *boombox) play() {
+	fmt.Fprintln(os.Stderr, "PLAYBACK to", boombox.brokerURL)
 	var (
 		count   int
 		data    []string
@@ -137,7 +129,7 @@ func play(client MQTT.Client, isBinary bool, isCounter bool, isFastforward bool)
 			panic(err)
 		}
 
-		if isBinary {
+		if boombox.isBinary {
 			// parse payload
 			payload, err2 = base64.StdEncoding.DecodeString(data[2])
 			if err2 != nil {
@@ -147,17 +139,17 @@ func play(client MQTT.Client, isBinary bool, isCounter bool, isFastforward bool)
 			payload = []byte(data[2])
 		}
 
-		if !isFastforward {
+		if !boombox.isFastforward {
 			time.Sleep(elapsed)
 		}
 
 		// sends
-		if token = client.Publish(data[1], 0, false, payload); token.Wait() && token.Error() != nil {
+		if token = boombox.mqttclient.Publish(data[1], 0, false, payload); token.Wait() && token.Error() != nil {
 			panic(token.Error())
 		}
 
 		count++
-		if isCounter {
+		if boombox.isCounter {
 			fmt.Fprintf(os.Stderr, "\rPLAY #%d", count)
 		}
 	}
@@ -167,35 +159,7 @@ func play(client MQTT.Client, isBinary bool, isCounter bool, isFastforward bool)
 	fmt.Fprintf(os.Stderr, "\rEND  #%d\n", count)
 }
 
-func quitme(client MQTT.Client) {
-	c := make(chan os.Signal, 2)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	<-c
-	client.Disconnect(0)
+func (boombox *boombox) close() {
+	boombox.mqttclient.Disconnect(0)
 	fmt.Fprintln(os.Stderr, "\rDISCONNECTED")
-	os.Exit(0)
-}
-
-func main() {
-	// cmdline parsing
-	brokerURL, topics, isBinary, isCounter, isFastforward := flagParse()
-	// connecting
-	client := mqttConnect(brokerURL)
-
-	go quitme(client)
-
-	// checks for stdin
-	stat, err := os.Stdin.Stat()
-	if err != nil {
-		panic(err)
-	}
-	stdinMode := stat.Mode()
-
-	if (stdinMode&os.ModeNamedPipe) != 0 || stdinMode.IsRegular() {
-		fmt.Fprintln(os.Stderr, "PLAYBACK to", brokerURL)
-		play(client, isBinary, isCounter, isFastforward)
-	} else {
-		fmt.Fprintln(os.Stderr, "RECORDING from", brokerURL)
-		record(client, topics, isBinary, isCounter)
-	}
 }
