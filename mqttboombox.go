@@ -22,6 +22,7 @@ type boombox struct {
 	isCounter     bool
 	isFastforward bool
 	mqttclient    MQTT.Client
+	options       *MQTT.ClientOptions
 	recordchan    chan message
 }
 
@@ -31,15 +32,27 @@ type message struct {
 	msg  MQTT.Message
 }
 
+func New(brokerURL string, topics []string, isBinary bool, isCounter bool, isFastforward bool) boombox {
+	o := boombox{
+		brokerURL:     brokerURL,
+		topics:        topics,
+		isBinary:      isBinary,
+		isCounter:     isCounter,
+		isFastforward: isFastforward,
+		options:       MQTT.NewClientOptions(),
+	}
+	return o
+}
+
 // connects to the mqtt broker
 func (boombox *boombox) mqttConnect() {
 	// options
-	opts := MQTT.NewClientOptions().AddBroker(boombox.brokerURL)
+	boombox.options.AddBroker(boombox.brokerURL)
 	// opts.SetClientID("mqttboombox" + strconv.FormatInt(time.Now().Unix(), 16))
-	opts.SetDefaultPublishHandler(func(client MQTT.Client, msg MQTT.Message) {
+	boombox.options.SetDefaultPublishHandler(func(client MQTT.Client, msg MQTT.Message) {
 		boombox.recordchan <- message{time.Now(), msg}
 	})
-	boombox.mqttclient = MQTT.NewClient(opts)
+	boombox.mqttclient = MQTT.NewClient(boombox.options)
 	if token := boombox.mqttclient.Connect(); token.Wait() && token.Error() != nil {
 		panic(token.Error())
 	}
