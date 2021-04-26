@@ -60,11 +60,12 @@ func (boombox *boombox) mqttConnect() {
 
 // subscribe to the list of topics
 func (boombox *boombox) mqttSubscribe() {
-	// TODO replace with SubscribeMultiple
+	t := make(map[string]byte)
 	for _, topic := range boombox.topics {
-		if token := boombox.mqttclient.Subscribe(topic, 0, nil); token.Wait() && token.Error() != nil {
-			panic(token.Error())
-		}
+		t[topic] = 0
+	}
+	if token := boombox.mqttclient.SubscribeMultiple(t, nil); token.Wait() && token.Error() != nil {
+		panic(token.Error())
 	}
 }
 
